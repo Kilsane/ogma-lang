@@ -1,243 +1,504 @@
 // ------------------------------------------------------------
-// OGMA — Module Parser (legacy REPL 0.2, corrigé pour 0.3.11)
-// ------------------------------------------------------------
-//
-// Le parseur transforme une liste de tokens (produits par le
-// lexer) en structures internes appelées Command.
-//
-// Version actuelle :
-//   - reconnaissance des valeurs simples (int, string, bool…)
-//   - reconnaissance des chemins a.b.c (corrigé, plus de a/b/c)
-//
-// Le parseur NE lit PAS la chaîne brute : il travaille
-// exclusivement sur les tokens. Cela permet d'ajouter plus tard :
-//   - les blocs { ... }
-//   - les listes [ ... ]
-//   - les objets { a: 1 }
-//   - les expressions
-//   - les appels de fonctions
-//   - les opérations
-//
-// Ce module reste un parseur REPL minimal, pas le parser 0.3.11
-// complet décrit dans la spec officielle.
+// OGMA — Parser 0.3.11
 // ------------------------------------------------------------
 
-use crate::value::OgmaValue;
+use crate::ast::*;
 use crate::lexer::Token;
 
-// ------------------------------------------------------------
-// Command : structure syntaxique interne
-// ------------------------------------------------------------
-//
-// Chaque ligne entrée dans Ogma est transformée en une Command.
-// Pour l'instant :
-//   - Value(...) : une valeur simple
-//   - Path([...]) : un chemin a.b.c
-//   - Block([...]) : un bloc { ... } très simplifié
-//
-// Plus tard (dans le vrai parser 0.3.11) :
-//   - Assign(name, expr)
-//   - Call(func, args)
-//   - Block(exprs)
-//   - Object(fields)
-//   - etc.
-// ------------------------------------------------------------
-#[derive(Debug)]
-pub enum Command {
-    Value(OgmaValue),
-    Path(Vec<String>),
-    Block(Vec<Command>),
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
 }
 
-// ------------------------------------------------------------
-// parse_path : reconnaissance d'un chemin a.b.c
-// ------------------------------------------------------------
-//
-// Un chemin est une suite :
-//   Ident "." Ident "." Ident...
-//
-// Le lexer fournit déjà les tokens nécessaires :
-//   Ident("a"), Dot, Ident("b"), Dot, Ident("c")
-//
-// Si la structure correspond, on renvoie Command::Path([...]).
-// Sinon, on renvoie None pour laisser le parseur essayer autre chose.
-// ------------------------------------------------------------
-fn parse_path(tokens: &[Token]) -> Option<Command> {
-    let mut parts = Vec::new();
-    let mut i = 0;
-
-    // Le premier token doit être un identifiant
-    match tokens.get(i) {
-        Some(Token::Ident(name)) => {
-            parts.push(name.clone());
-            i += 1;
-        }
-        _ => return None, // pas un chemin
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Parser { tokens, pos: 0 }
     }
 
-    // Ensuite : (Dot Ident)* répété
-    while i + 1 < tokens.len() {
-        match (&tokens[i], &tokens[i + 1]) {
-            (Token::Dot, Token::Ident(name)) => {
-                parts.push(name.clone());
-                i += 2;
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<&Token> {
+        let t = self.tokens.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn match_token(&mut self, expected: &Token) -> bool
+    where
+        Token: PartialEq,
+    {
+        if let Some(t) = self.peek() {
+            if t == expected {
+                self.pos += 1;
+                return true;
             }
-            _ => break,
+        }
+        false
+    }
+
+    fn expect(&mut self, expected: &Token) -> Result<(), String>
+    where
+        Token: PartialEq + std::fmt::Debug,
+    {
+        match self.next() {
+            Some(t) if t == expected => Ok(()),
+            other => Err(format!("Attendu {:?}, trouvé {:?}", expected, other)),
         }
     }
 
-    // Si on a au moins 2 éléments, c’est un vrai chemin
-    if parts.len() >= 2 {
-        Some(Command::Path(parts))
-    } else {
-        None
-    }
-}
-
-// ------------------------------------------------------------
-// parse_block : reconnaissance d'un bloc { ... }
-// ------------------------------------------------------------
-//
-// Un bloc commence par '{' et se termine par '}'.
-// Il contient plusieurs commandes, séparées par des retours à la ligne.
-//
-// Exemple :
-// {
-//     int 1
-//     int 2
-// }
-//
-// Résultat : Block([Value(1), Value(2)])
-//
-// ⚠️ Version simplifiée : ce n’est PAS encore le bloc 0.3.11 officiel.
-// ------------------------------------------------------------
-fn parse_block(tokens: &[Token]) -> Option<(Command, usize)> {
-    let mut i = 0;
-
-    // Le premier token doit être '{'
-    match tokens.get(i) {
-        Some(Token::LBrace) => i += 1,
-        _ => return None,
+    fn expect_ident(&mut self) -> Result<String, String> {
+        match self.next() {
+            Some(Token::Ident(name)) => Ok(name.clone()),
+            other => Err(format!("Identifiant attendu, trouvé {:?}", other)),
+        }
     }
 
-    let mut commands = Vec::new();
+    // --------------------------------------------------------
+    // Entrée principale : un fichier .ogma
+    // --------------------------------------------------------
+    pub fn parse_module_file(&mut self, name: String) -> Result<ModuleFile, String> {
+        let imports = self.parse_imports()?;
+        let mut declarations = Vec::new();
 
-    // Lire les commandes jusqu'à '}'
-    while i < tokens.len() {
-        match tokens.get(i) {
-            Some(Token::RBrace) => {
-                // Fin du bloc
-                return Some((Command::Block(commands), i + 1));
+        while let Some(tok) = self.peek() {
+            match tok {
+                Token::EOF | Token::RBrace => break,
+                _ => {
+                    let decl = self.parse_declaration()?;
+                    declarations.push(decl);
+                }
+            }
+        }
+
+        Ok(ModuleFile {
+            name,
+            imports,
+            declarations,
+        })
+    }
+
+    // --------------------------------------------------------
+    // Imports
+    // --------------------------------------------------------
+    fn parse_imports(&mut self) -> Result<Vec<Import>, String> {
+        let mut imports = Vec::new();
+
+        loop {
+            match self.peek() {
+                Some(Token::Import) => {
+                    self.next(); // 'import'
+                    let module_name = self.expect_ident()?;
+
+                    let alias = if self.match_token(&Token::As) {
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+
+                    imports.push(Import {
+                        module: module_name,
+                        alias,
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        Ok(imports)
+    }
+
+    // --------------------------------------------------------
+    // Déclarations (variable, fonction, objet, module)
+    // --------------------------------------------------------
+    fn parse_declaration(&mut self) -> Result<Decl, String> {
+        match self.peek() {
+            Some(Token::Module) => self.parse_module_decl(),
+            Some(Token::Ident(_)) => self.parse_toplevel_named_decl(),
+            Some(Token::Object) => self.parse_object_decl_toplevel(),
+            other => Err(format!("Déclaration inattendue : {:?}", other)),
+        }
+    }
+
+    // nom: ... au sommet
+    fn parse_toplevel_named_decl(&mut self) -> Result<Decl, String> {
+        let name = self.expect_ident()?;
+        self.expect(&Token::Colon)?;
+
+        match self.peek() {
+            Some(Token::Fn) => {
+                self.next(); // 'fn'
+                self.parse_function_decl_after_name(name)
+            }
+            Some(Token::Object) => {
+                self.next(); // 'object'
+                self.parse_object_decl_after_name(name)
             }
             _ => {
-                // On parse une commande interne (très simplifié)
-                let cmd = parse_tokens(&tokens[i..]).ok()?;
-                commands.push(cmd);
-
-                // Avancer d'un token (simplifié pour l'instant)
-                i += 1;
+                let type_hint = self.parse_type_ref()?;
+                self.expect(&Token::Equal)?;
+                let value = self.parse_expression()?;
+                Ok(Decl::Variable(VarDecl {
+                    name,
+                    type_hint,
+                    value,
+                }))
             }
         }
     }
 
-    None // pas de '}' trouvé
-}
+    // module math { ... }
+    fn parse_module_decl(&mut self) -> Result<Decl, String> {
+        self.next(); // 'module'
+        let name = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
 
-// ------------------------------------------------------------
-// parse_tokens : parseur principal (REPL minimal)
-// ------------------------------------------------------------
-//
-// Reçoit une liste de tokens et tente de reconnaître :
-//   1) un bloc { ... }
-//   2) un chemin a.b.c
-//   3) une commande simple (int, string, bool…)
-//   4) sinon → erreur
-//
-// L'ordre est important :
-//   - un bloc commence par '{'
-//   - un chemin commence par un identifiant
-//   - donc on doit tester "bloc" puis "chemin" AVANT "commande"
-// ------------------------------------------------------------
-pub fn parse_tokens(tokens: &[Token]) -> Result<Command, String> {
-    if tokens.is_empty() {
-        return Err("Ligne vide".to_string());
+        let mut declarations = Vec::new();
+        while !self.match_token(&Token::RBrace) {
+            let decl = self.parse_declaration()?;
+            declarations.push(decl);
+        }
+
+        Ok(Decl::Module(NestedModuleDecl { name, declarations }))
     }
 
-    // 1) Tentative : est-ce un bloc ?
-    if let Some((cmd, _consumed)) = parse_block(tokens) {
-        return Ok(cmd);
+    // nom: fn(...) -> type { ... }
+    fn parse_function_decl_after_name(&mut self, name: String) -> Result<Decl, String> {
+        self.expect(&Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(&Token::RParen)?;
+
+        let return_type = if self.match_token(&Token::Arrow) {
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+
+        let body = self.parse_block()?;
+
+        Ok(Decl::Function(FuncDecl {
+            name,
+            params,
+            return_type,
+            body,
+        }))
     }
 
-    // 2) Tentative : est-ce un chemin ?
-    if let Some(cmd) = parse_path(tokens) {
-        return Ok(cmd);
+    fn parse_params(&mut self) -> Result<Vec<Param>, String> {
+        let mut params = Vec::new();
+
+        loop {
+            match self.peek() {
+                Some(Token::Ident(_)) => {
+                    let name = self.expect_ident()?;
+                    self.expect(&Token::Colon)?;
+                    let type_hint = self.parse_type_ref()?;
+                    params.push(Param { name, type_hint });
+
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(params)
     }
 
-    // 3) Commandes simples (int, string, bool, decimal, ognum)
-    match &tokens[0] {
-        // int 42
-        Token::Ident(cmd) if cmd == "int" => {
-            if tokens.len() != 2 {
-                return Err("Usage : int <nombre>".to_string());
+    // object au sommet sans nom (on ne le supporte pas pour l’instant)
+    fn parse_object_decl_toplevel(&mut self) -> Result<Decl, String> {
+        self.next(); // 'object'
+        Err("object sans nom au sommet non supporté dans cette version".to_string())
+    }
+
+    // nom: object { ... }
+    fn parse_object_decl_after_name(&mut self, name: String) -> Result<Decl, String> {
+        let fields = self.parse_object_fields()?;
+        Ok(Decl::Object(ObjectDecl { name, fields }))
+    }
+
+    fn parse_object_fields(&mut self) -> Result<Vec<ObjectField>, String> {
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+
+        while !self.match_token(&Token::RBrace) {
+            let mutable = self.match_token(&Token::Mut);
+            let name = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let type_hint = self.parse_type_ref()?;
+            self.expect(&Token::Equal)?;
+            let value = self.parse_expression()?;
+
+            fields.push(ObjectField {
+                mutable,
+                name,
+                type_hint,
+                value,
+            });
+        }
+
+        Ok(fields)
+    }
+
+    // --------------------------------------------------------
+    // Types
+    // --------------------------------------------------------
+    fn parse_type_ref(&mut self) -> Result<TypeRef, String> {
+        match self.peek() {
+            Some(Token::Ident(name)) if name == "ognum" => {
+                self.next(); // 'ognum'
+                self.expect(&Token::LParen)?;
+                let prec = self.parse_int_literal()? as i32;
+                self.expect(&Token::Comma)?;
+                let scale = self.parse_int_literal()? as i32;
+                self.expect(&Token::RParen)?;
+                Ok(TypeRef::Ognum {
+                    precision: prec,
+                    scale,
+                })
             }
-            match &tokens[1] {
-                Token::Number(n) => match n.parse::<i64>() {
-                    Ok(v) => Ok(Command::Value(OgmaValue::Int(v))),
-                    Err(_) => Err("Impossible de convertir en entier.".to_string()),
-                },
-                _ => Err("int attend un nombre".to_string()),
+            Some(Token::Ident(name)) => {
+                let n = name.clone();
+                self.next();
+                Ok(TypeRef::Simple(n))
+            }
+            other => Err(format!("Type attendu, trouvé {:?}", other)),
+        }
+    }
+
+    fn parse_int_literal(&mut self) -> Result<i64, String> {
+        match self.next() {
+            Some(Token::Number(n)) => n
+                .parse::<i64>()
+                .map_err(|_| "Nombre entier attendu".to_string()),
+            other => Err(format!("Nombre entier attendu, trouvé {:?}", other)),
+        }
+    }
+
+    // --------------------------------------------------------
+    // Blocs
+    // --------------------------------------------------------
+    fn parse_block(&mut self) -> Result<Block, String> {
+        self.expect(&Token::LBrace)?;
+
+        let mut statements = Vec::new();
+        let mut last_expr: Option<Expr> = None;
+
+        while !self.match_token(&Token::RBrace) {
+            if self.is_start_of_decl_in_block() {
+                let decl = self.parse_block_var_decl()?;
+                statements.push(Stmt::Decl(decl));
+            } else {
+                let expr = self.parse_expression()?;
+                // on considère que c’est une expression "statement"
+                statements.push(Stmt::Expr(Box::new(expr.clone())));
+                last_expr = Some(expr);
             }
         }
 
-        // string "hello"
-        Token::Ident(cmd) if cmd == "string" => {
-            if tokens.len() != 2 {
-                return Err("Usage : string \"texte\"".to_string());
-            }
-            match &tokens[1] {
-                Token::StringLiteral(s) => Ok(Command::Value(OgmaValue::String(s.clone()))),
-                _ => Err("string attend une chaîne entre guillemets".to_string()),
+        Ok(Block {
+            statements,
+            last_expr,
+        })
+    }
+
+    fn is_start_of_decl_in_block(&mut self) -> bool {
+        matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Mut))
+    }
+
+    // x: int = expr  ou  mut x: int = expr
+    fn parse_block_var_decl(&mut self) -> Result<VarDecl, String> {
+        let _mutable = self.match_token(&Token::Mut);
+        let name = self.expect_ident()?;
+        self.expect(&Token::Colon)?;
+        let type_hint = self.parse_type_ref()?;
+        self.expect(&Token::Equal)?;
+        let value = self.parse_expression()?;
+
+        Ok(VarDecl {
+            name,
+            type_hint,
+            value,
+        })
+    }
+
+    // --------------------------------------------------------
+    // Expressions (version minimale)
+    // --------------------------------------------------------
+    fn parse_expression(&mut self) -> Result<Expr, String> {
+        // Pour l’instant : pas de gestion des opérateurs binaires,
+        // seulement primary + suffixes (chemin, appel).
+        self.parse_call_or_path_or_primary()
+    }
+
+    fn parse_call_or_path_or_primary(&mut self) -> Result<Expr, String> {
+        let mut expr = self.parse_primary()?;
+
+        loop {
+            match self.peek() {
+                Some(Token::Dot) => {
+                    self.next(); // '.'
+                    let segment = self.expect_ident()?;
+
+                    if self.match_token(&Token::LParen) {
+                        let args = self.parse_args()?;
+                        self.expect(&Token::RParen)?;
+                        expr = Expr::MethodCall(MethodCall {
+                            target: Box::new(expr),
+                            method: segment,
+                            args,
+                        });
+                    } else {
+                        expr = match expr {
+                            Expr::Path(mut p) => {
+                                p.segments.push(segment);
+                                Expr::Path(p)
+                            }
+                            Expr::Identifier(name) => Expr::Path(Path {
+                                segments: vec![name, segment],
+                            }),
+                            other => {
+                                return Err(format!(
+                                    "Chemin invalide après expression {:?}",
+                                    other
+                                ))
+                            }
+                        };
+                    }
+                }
+                Some(Token::LParen) => {
+                    self.next(); // '('
+                    let args = self.parse_args()?;
+                    self.expect(&Token::RParen)?;
+                    expr = Expr::Call(Call {
+                        function: Box::new(expr),
+                        args,
+                    });
+                }
+                _ => break,
             }
         }
 
-        // bool true / false
-        Token::Ident(cmd) if cmd == "bool" => {
-            if tokens.len() != 2 {
-                return Err("Usage : bool <true|false>".to_string());
-            }
-            match &tokens[1] {
-                Token::Ident(v) if v == "true" => Ok(Command::Value(OgmaValue::Bool(true))),
-                Token::Ident(v) if v == "false" => Ok(Command::Value(OgmaValue::Bool(false))),
-                _ => Err("bool attend true ou false".to_string()),
+        Ok(expr)
+    }
+
+    fn parse_args(&mut self) -> Result<Vec<Expr>, String> {
+        let mut args = Vec::new();
+
+        loop {
+            match self.peek() {
+                Some(Token::RParen) => break,
+                _ => {
+                    let expr = self.parse_expression()?;
+                    args.push(expr);
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
             }
         }
 
-        // decimal 3.14
-        Token::Ident(cmd) if cmd == "decimal" => {
-            if tokens.len() != 2 {
-                return Err("Usage : decimal <nombre>".to_string());
+        Ok(args)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, String> {
+        match self.peek() {
+            Some(Token::Number(_)) => {
+                let lit = self.parse_number_literal()?;
+                Ok(Expr::Literal(lit))
             }
-            match &tokens[1] {
-                Token::Number(n) => match n.parse::<f64>() {
-                    Ok(v) => Ok(Command::Value(OgmaValue::Decimal(v))),
-                    Err(_) => Err("Impossible de convertir en décimal".to_string()),
-                },
-                _ => Err("decimal attend un nombre".to_string()),
+            Some(Token::StringLiteral(_)) => {
+                let lit = self.parse_string_literal()?;
+                Ok(Expr::Literal(lit))
+            }
+            Some(Token::CharLiteral(_)) => {
+                let lit = self.parse_char_literal()?;
+                Ok(Expr::Literal(lit))
+            }
+            Some(Token::Ident(name)) if name == "true" || name == "false" => {
+                let lit = self.parse_bool_literal()?;
+                Ok(Expr::Literal(lit))
+            }
+            Some(Token::Ident(_)) => {
+                let name = self.expect_ident()?;
+                Ok(Expr::Identifier(name))
+            }
+            Some(Token::LBrace) => {
+                let block = self.parse_block()?;
+                Ok(Expr::Block(Box::new(block)))
+            }
+            Some(Token::BlockKw) => {
+                self.next(); // 'block'
+                let block = self.parse_block()?;
+                Ok(Expr::ExplicitBlock(Box::new(block)))
+            }
+            Some(Token::LBracket) => {
+                let dialect = self.parse_dialect_block()?;
+                Ok(Expr::Dialect(dialect))
+            }
+            other => Err(format!("Expression inattendue : {:?}", other)),
+        }
+    }
+
+    fn parse_number_literal(&mut self) -> Result<Literal, String> {
+        match self.next() {
+            Some(Token::Number(n)) => {
+                if n.contains('.') {
+                    n.parse::<f64>()
+                        .map(Literal::Decimal)
+                        .map_err(|_| "Décimal invalide".to_string())
+                } else {
+                    n.parse::<i64>()
+                        .map(Literal::Int)
+                        .map_err(|_| "Entier invalide".to_string())
+                }
+            }
+            other => Err(format!("Nombre attendu, trouvé {:?}", other)),
+        }
+    }
+
+    fn parse_string_literal(&mut self) -> Result<Literal, String> {
+        match self.next() {
+            Some(Token::StringLiteral(s)) => Ok(Literal::String(s.clone())),
+            other => Err(format!("Chaîne attendue, trouvé {:?}", other)),
+        }
+    }
+
+    fn parse_char_literal(&mut self) -> Result<Literal, String> {
+        match self.next() {
+            Some(Token::CharLiteral(c)) => Ok(Literal::Char(*c)),
+            other => Err(format!("Caractère attendu, trouvé {:?}", other)),
+        }
+    }
+
+    fn parse_bool_literal(&mut self) -> Result<Literal, String> {
+        match self.next() {
+            Some(Token::Ident(name)) if name == "true" => Ok(Literal::Bool(true)),
+            Some(Token::Ident(name)) if name == "false" => Ok(Literal::Bool(false)),
+            other => Err(format!("bool attendu, trouvé {:?}", other)),
+        }
+    }
+
+    fn parse_dialect_block(&mut self) -> Result<DialectBlock, String> {
+        self.expect(&Token::LBracket)?;
+        let mut lines = Vec::new();
+
+        while !self.match_token(&Token::RBracket) {
+            match self.next() {
+                Some(Token::Ident(s)) => lines.push(s.clone()),
+                Some(Token::StringLiteral(s)) => lines.push(s.clone()),
+                Some(Token::Number(n)) => lines.push(n.clone()),
+                Some(Token::RBracket) => break,
+                other => {
+                    return Err(format!("Token inattendu dans dialecte : {:?}", other));
+                }
             }
         }
 
-        // ognum 123.45 (forme REPL, pas la forme type ognum(p,s))
-        Token::Ident(cmd) if cmd == "ognum" => {
-            if tokens.len() != 2 {
-                return Err("Usage : ognum <nombre>".to_string());
-            }
-            match &tokens[1] {
-                Token::Number(n) => Ok(Command::Value(OgmaValue::Ognum(n.clone()))),
-                _ => Err("ognum attend un nombre".to_string()),
-            }
-        }
-
-        // 4) Rien ne correspond → erreur
-        _ => Err("Commande inconnue".to_string()),
+        Ok(DialectBlock { lines })
     }
 }

@@ -8,4 +8,3 @@ pub enum OgmaValue {
     Decimal(f64),
     Ognum(String),
 }
-

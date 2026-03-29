@@ -1,29 +1,29 @@
 // ------------------------------------------------------------
-// OGMA — Module Lexer (version 0.2)
-// ------------------------------------------------------------
-//
-// Le rôle du lexer est de transformer une chaîne brute en une
-// liste de tokens structurés. Le parseur n'analyse plus du texte,
-// mais uniquement ces tokens.
-//
-// Cette version gère :
-//   - les identifiants
-//   - les nombres
-//   - les chaînes entre guillemets
-//   - les symboles simples : { } [ ] ( ) : , /
-//   - les symboles multi-caractères : == != <= >= -> => :: .. ...
-//   - les espaces et retours à la ligne
-//
-// Le lexer lit caractère par caractère, et peut regarder le
-// caractère suivant (peek) pour détecter les symboles composés.
+// OGMA — Module Lexer (aligné 0.3.11, version simple)
 // ------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // Valeurs
+    // Identifiants et mots-clés
     Ident(String),
+
+    // Littéraux
     Number(String),
     StringLiteral(String),
+    CharLiteral(char),
+
+    // Mots-clés structurants
+    Import,
+    As,
+    Module,
+    Fn,
+    Object,
+    Mut,
+    BlockKw, // mot-clé 'block'
+
+    // Booléens (optionnel : on peut aussi les laisser en Ident)
+    // True,
+    // False,
 
     // Symboles simples
     LBrace,     // {
@@ -34,7 +34,8 @@ pub enum Token {
     RParen,     // )
     Colon,      // :
     Comma,      // ,
-    Slash,      // /
+    Dot,        // .
+    Equal,      // =
     Minus,      // -
 
     // Symboles multi-caractères
@@ -64,7 +65,6 @@ impl Lexer {
         }
     }
 
-    // Lit le caractère courant et avance
     fn next_char(&mut self) -> Option<char> {
         if self.pos >= self.chars.len() {
             None
@@ -75,12 +75,10 @@ impl Lexer {
         }
     }
 
-    // Regarde le caractère suivant sans avancer
     fn peek_char(&self) -> Option<char> {
         self.chars.get(self.pos).cloned()
     }
 
-    // Consomme tant que la condition est vraie
     fn consume_while<F>(&mut self, cond: F) -> String
     where
         F: Fn(char) -> bool,
@@ -97,23 +95,17 @@ impl Lexer {
         result
     }
 
-    // Fonction principale : transforme l'entrée en tokens
     pub fn tokenize(&mut self) -> Vec<Token> {
         let mut tokens = Vec::new();
 
         while let Some(c) = self.next_char() {
             match c {
-
-                // ------------------------------------------------------------
                 // ESPACES
-                // ------------------------------------------------------------
                 c if c.is_whitespace() => continue,
 
-                // ------------------------------------------------------------
-                // NOMBRES
-                // ------------------------------------------------------------
+                // NOMBRES (entiers / décimaux, avec éventuel signe -)
                 c if c.is_ascii_digit() || c == '-' => {
-                    // Attention : '-' peut être un symbole ou un nombre
+                    // '-' peut être un symbole ou le début d'un nombre
                     if c == '-' && self.peek_char() == Some('>') {
                         self.next_char();
                         tokens.push(Token::Arrow);
@@ -125,27 +117,44 @@ impl Lexer {
                     tokens.push(Token::Number(number));
                 }
 
-                // ------------------------------------------------------------
-                // IDENTIFIANTS
-                // ------------------------------------------------------------
-                c if c.is_ascii_alphabetic() => {
+                // IDENTIFIANTS / MOTS-CLÉS
+                c if c.is_ascii_alphabetic() || c == '_' => {
                     let mut ident = c.to_string();
                     ident.push_str(&self.consume_while(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
-                    tokens.push(Token::Ident(ident));
+
+                    let tok = match ident.as_str() {
+                        "import" => Token::Import,
+                        "as" => Token::As,
+                        "module" => Token::Module,
+                        "fn" => Token::Fn,
+                        "object" => Token::Object,
+                        "mut" => Token::Mut,
+                        "block" => Token::BlockKw,
+                        // "true" => Token::True,
+                        // "false" => Token::False,
+                        _ => Token::Ident(ident),
+                    };
+
+                    tokens.push(tok);
                 }
 
-                // ------------------------------------------------------------
                 // CHAÎNES "..."
-                // ------------------------------------------------------------
                 '"' => {
                     let content = self.consume_while(|ch| ch != '"');
-                    self.next_char(); // consomme le guillemet fermant
+                    self.next_char(); // guillemet fermant
                     tokens.push(Token::StringLiteral(content));
                 }
 
-                // ------------------------------------------------------------
+                // CARACTÈRES 'A'
+                '\'' => {
+                    let content = self.next_char();
+                    let _ = self.next_char(); // consomme l'apostrophe fermante (naïf)
+                    if let Some(ch) = content {
+                        tokens.push(Token::CharLiteral(ch));
+                    }
+                }
+
                 // SYMBOLES MULTI-CARACTÈRES
-                // ------------------------------------------------------------
                 '=' => {
                     if self.peek_char() == Some('=') {
                         self.next_char();
@@ -153,6 +162,8 @@ impl Lexer {
                     } else if self.peek_char() == Some('>') {
                         self.next_char();
                         tokens.push(Token::FatArrow);
+                    } else {
+                        tokens.push(Token::Equal);
                     }
                 }
 
@@ -195,12 +206,12 @@ impl Lexer {
                         } else {
                             tokens.push(Token::Range);
                         }
+                    } else {
+                        tokens.push(Token::Dot);
                     }
                 }
 
-                // ------------------------------------------------------------
                 // SYMBOLES SIMPLES
-                // ------------------------------------------------------------
                 '{' => tokens.push(Token::LBrace),
                 '}' => tokens.push(Token::RBrace),
                 '[' => tokens.push(Token::LBracket),
@@ -208,13 +219,10 @@ impl Lexer {
                 '(' => tokens.push(Token::LParen),
                 ')' => tokens.push(Token::RParen),
                 ',' => tokens.push(Token::Comma),
-                '/' => tokens.push(Token::Slash),
 
-                // ------------------------------------------------------------
                 // CARACTÈRE INCONNU
-                // ------------------------------------------------------------
                 _ => {
-                    // On pourrait générer une erreur plus tard
+                    // tu pourras plus tard générer une erreur lexicale
                 }
             }
         }

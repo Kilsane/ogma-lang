@@ -1,61 +1,53 @@
 // ------------------------------------------------------------
-// OGMA — Module REPL
+// OGMA — REPL 0.3.11 (prototype)
 // ------------------------------------------------------------
 //
-// Le REPL (Read–Eval–Print Loop) est la boucle interactive
-// d’Ogma. Il lit une ligne, la transforme en tokens via le lexer,
-// puis en Command via le parseur, et affiche le résultat.
-//
-// Cette version 0.1 ne gère que des valeurs simples, mais la
-// structure est prête pour accueillir :
-//
-//   - des commandes internes
-//   - des blocs multi-lignes
-//   - des erreurs plus détaillées
-//   - un environnement d'exécution
+// Pour l’instant :
+// - lit une ligne
+// - la tokenize
+// - la parse comme un "mini-fichier" Ogma
+// - affiche l’AST résultant
 // ------------------------------------------------------------
 
 use std::io::{self, Write};
+
 use crate::lexer::Lexer;
-use crate::parser::{parse_tokens, Command};
+use crate::parser::Parser;
 
 pub fn run_repl() {
-    println!("Ogma 0.0.1 - Prototype pédagogique");
-    println!("Tape : int 42");
+    println!("Ogma 0.3.11 - REPL prototype");
+    println!("Tape une déclaration Ogma (ex: x: int = 10)");
     println!("Ctrl+C pour quitter.\n");
 
     loop {
         let mut input = String::new();
 
-        // Invite
         print!("ogma> ");
-        std::io::stdout().flush().unwrap();
+        io::stdout().flush().unwrap();
 
-        // Lecture de la ligne
-        io::stdin().read_line(&mut input).expect("Erreur de lecture");
+        if io::stdin().read_line(&mut input).is_err() {
+            println!("Erreur de lecture");
+            continue;
+        }
 
-        // Étape 1 : lexer → tokens
+        // ignorer les lignes vides
+        if input.trim().is_empty() {
+            continue;
+        }
+
+        // 1) Lexer
         let mut lexer = Lexer::new(&input);
         let tokens = lexer.tokenize();
 
-        // Étape 2 : parseur → Command
-        match parse_tokens(&tokens) {
-
-    Ok(Command::Value(v)) => {
-        println!("→ Valeur Ogma : {:?}", v);
-    }
-
-    Ok(Command::Path(parts)) => {
-        println!("→ Chemin Ogma : {:?}", parts);
-    }
-
-    Ok(Command::Block(cmds)) => {
-        println!("→ Bloc Ogma : {:?}", cmds);
-    }
-
-    Err(e) => {
-        println!("Erreur : {}", e);
-    }
-}
+        // 2) Parser
+        let mut parser = Parser::new(tokens);
+        match parser.parse_module_file("repl".to_string()) {
+            Ok(module) => {
+                println!("→ AST : {:#?}", module);
+            }
+            Err(e) => {
+                println!("Erreur de parsing : {}", e);
+            }
+        }
     }
 }
