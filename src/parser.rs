@@ -1,13 +1,13 @@
 // ------------------------------------------------------------
-// OGMA — Module Parser
+// OGMA — Module Parser (legacy REPL 0.2, corrigé pour 0.3.11)
 // ------------------------------------------------------------
 //
 // Le parseur transforme une liste de tokens (produits par le
 // lexer) en structures internes appelées Command.
 //
-// Architecture actuelle (version 0.2) :
+// Version actuelle :
 //   - reconnaissance des valeurs simples (int, string, bool…)
-//   - reconnaissance des chemins a/b/c
+//   - reconnaissance des chemins a.b.c (corrigé, plus de a/b/c)
 //
 // Le parseur NE lit PAS la chaîne brute : il travaille
 // exclusivement sur les tokens. Cela permet d'ajouter plus tard :
@@ -18,7 +18,8 @@
 //   - les appels de fonctions
 //   - les opérations
 //
-// Le parseur est volontairement simple mais propre et extensible.
+// Ce module reste un parseur REPL minimal, pas le parser 0.3.11
+// complet décrit dans la spec officielle.
 // ------------------------------------------------------------
 
 use crate::value::OgmaValue;
@@ -31,14 +32,14 @@ use crate::lexer::Token;
 // Chaque ligne entrée dans Ogma est transformée en une Command.
 // Pour l'instant :
 //   - Value(...) : une valeur simple
-//   - Path([...]) : un chemin a/b/c
+//   - Path([...]) : un chemin a.b.c
+//   - Block([...]) : un bloc { ... } très simplifié
 //
-// Plus tard :
+// Plus tard (dans le vrai parser 0.3.11) :
 //   - Assign(name, expr)
 //   - Call(func, args)
 //   - Block(exprs)
 //   - Object(fields)
-//   - List(items)
 //   - etc.
 // ------------------------------------------------------------
 #[derive(Debug)]
@@ -49,14 +50,14 @@ pub enum Command {
 }
 
 // ------------------------------------------------------------
-// parse_path : reconnaissance d'un chemin a/b/c
+// parse_path : reconnaissance d'un chemin a.b.c
 // ------------------------------------------------------------
 //
 // Un chemin est une suite :
-//   Ident Slash Ident Slash Ident...
+//   Ident "." Ident "." Ident...
 //
 // Le lexer fournit déjà les tokens nécessaires :
-//   Ident("a"), Slash, Ident("b"), Slash, Ident("c")
+//   Ident("a"), Dot, Ident("b"), Dot, Ident("c")
 //
 // Si la structure correspond, on renvoie Command::Path([...]).
 // Sinon, on renvoie None pour laisser le parseur essayer autre chose.
@@ -74,10 +75,10 @@ fn parse_path(tokens: &[Token]) -> Option<Command> {
         _ => return None, // pas un chemin
     }
 
-    // Ensuite : (Slash Ident)* répété
+    // Ensuite : (Dot Ident)* répété
     while i + 1 < tokens.len() {
         match (&tokens[i], &tokens[i + 1]) {
-            (Token::Slash, Token::Ident(name)) => {
+            (Token::Dot, Token::Ident(name)) => {
                 parts.push(name.clone());
                 i += 2;
             }
@@ -107,8 +108,9 @@ fn parse_path(tokens: &[Token]) -> Option<Command> {
 // }
 //
 // Résultat : Block([Value(1), Value(2)])
+//
+// ⚠️ Version simplifiée : ce n’est PAS encore le bloc 0.3.11 officiel.
 // ------------------------------------------------------------
-
 fn parse_block(tokens: &[Token]) -> Option<(Command, usize)> {
     let mut i = 0;
 
@@ -128,9 +130,8 @@ fn parse_block(tokens: &[Token]) -> Option<(Command, usize)> {
                 return Some((Command::Block(commands), i + 1));
             }
             _ => {
-                // On parse une commande interne
+                // On parse une commande interne (très simplifié)
                 let cmd = parse_tokens(&tokens[i..]).ok()?;
-                
                 commands.push(cmd);
 
                 // Avancer d'un token (simplifié pour l'instant)
@@ -143,52 +144,47 @@ fn parse_block(tokens: &[Token]) -> Option<(Command, usize)> {
 }
 
 // ------------------------------------------------------------
-// parse_tokens : parseur principal
+// parse_tokens : parseur principal (REPL minimal)
 // ------------------------------------------------------------
 //
 // Reçoit une liste de tokens et tente de reconnaître :
-//   1) un chemin a/b/c
-//   2) une commande simple (int, string, bool…)
-//   3) sinon → erreur
+//   1) un bloc { ... }
+//   2) un chemin a.b.c
+//   3) une commande simple (int, string, bool…)
+//   4) sinon → erreur
 //
 // L'ordre est important :
+//   - un bloc commence par '{'
 //   - un chemin commence par un identifiant
-//   - donc on doit tester "chemin" AVANT "commande"
+//   - donc on doit tester "bloc" puis "chemin" AVANT "commande"
 // ------------------------------------------------------------
 pub fn parse_tokens(tokens: &[Token]) -> Result<Command, String> {
     if tokens.is_empty() {
         return Err("Ligne vide".to_string());
     }
-// --------------------------------------------------------
-// Tentative : est-ce un bloc ?
-// --------------------------------------------------------
-if let Some((cmd, _consumed)) = parse_block(tokens) {
-    return Ok(cmd);
-}
-    // --------------------------------------------------------
-    // 1) Tentative : est-ce un chemin ?
-    // --------------------------------------------------------
+
+    // 1) Tentative : est-ce un bloc ?
+    if let Some((cmd, _consumed)) = parse_block(tokens) {
+        return Ok(cmd);
+    }
+
+    // 2) Tentative : est-ce un chemin ?
     if let Some(cmd) = parse_path(tokens) {
         return Ok(cmd);
     }
 
-    // --------------------------------------------------------
-    // 2) Commandes simples (int, string, bool, decimal, ognum)
-    // --------------------------------------------------------
+    // 3) Commandes simples (int, string, bool, decimal, ognum)
     match &tokens[0] {
-
         // int 42
         Token::Ident(cmd) if cmd == "int" => {
             if tokens.len() != 2 {
                 return Err("Usage : int <nombre>".to_string());
             }
             match &tokens[1] {
-                Token::Number(n) => {
-                    match n.parse::<i64>() {
-                        Ok(v) => Ok(Command::Value(OgmaValue::Int(v))),
-                        Err(_) => Err("Impossible de convertir en entier.".to_string()),
-                    }
-                }
+                Token::Number(n) => match n.parse::<i64>() {
+                    Ok(v) => Ok(Command::Value(OgmaValue::Int(v))),
+                    Err(_) => Err("Impossible de convertir en entier.".to_string()),
+                },
                 _ => Err("int attend un nombre".to_string()),
             }
         }
@@ -199,9 +195,7 @@ if let Some((cmd, _consumed)) = parse_block(tokens) {
                 return Err("Usage : string \"texte\"".to_string());
             }
             match &tokens[1] {
-                Token::StringLiteral(s) => {
-                    Ok(Command::Value(OgmaValue::String(s.clone())))
-                }
+                Token::StringLiteral(s) => Ok(Command::Value(OgmaValue::String(s.clone()))),
                 _ => Err("string attend une chaîne entre guillemets".to_string()),
             }
         }
@@ -224,17 +218,15 @@ if let Some((cmd, _consumed)) = parse_block(tokens) {
                 return Err("Usage : decimal <nombre>".to_string());
             }
             match &tokens[1] {
-                Token::Number(n) => {
-                    match n.parse::<f64>() {
-                        Ok(v) => Ok(Command::Value(OgmaValue::Decimal(v))),
-                        Err(_) => Err("Impossible de convertir en décimal".to_string()),
-                    }
-                }
+                Token::Number(n) => match n.parse::<f64>() {
+                    Ok(v) => Ok(Command::Value(OgmaValue::Decimal(v))),
+                    Err(_) => Err("Impossible de convertir en décimal".to_string()),
+                },
                 _ => Err("decimal attend un nombre".to_string()),
             }
         }
 
-        // ognum 123.45
+        // ognum 123.45 (forme REPL, pas la forme type ognum(p,s))
         Token::Ident(cmd) if cmd == "ognum" => {
             if tokens.len() != 2 {
                 return Err("Usage : ognum <nombre>".to_string());
@@ -245,9 +237,7 @@ if let Some((cmd, _consumed)) = parse_block(tokens) {
             }
         }
 
-        // --------------------------------------------------------
-        // 3) Rien ne correspond → erreur
-        // --------------------------------------------------------
+        // 4) Rien ne correspond → erreur
         _ => Err("Commande inconnue".to_string()),
     }
 }
