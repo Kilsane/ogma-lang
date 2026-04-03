@@ -122,7 +122,7 @@ Uniquement valides à l\'intérieur de blocs \[ \... \].
 
 - ==, !=, \<, \>, \<=, \>=
 
-- and, or, not
+- &, or, not
 
 **6.3 Symboles de Structure (Crucial)**
 
